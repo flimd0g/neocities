@@ -1,4 +1,3 @@
-
 (function () {
   // ---- EASY CONFIG ----
   const CAT_COUNT = 4;
@@ -84,16 +83,20 @@
     cat.dragging = true;
     cat.state = 'dragged';
     cat.el.style.cursor = 'grabbing';
-    cat.el.setPointerCapture(e.pointerId);
+    try { cat.el.setPointerCapture(e.pointerId); } catch (err) { /* pointer already gone; ignore */ }
     setFrame(cat.el, ALERT);
   }
 
   function endDrag(cat) {
+    if (!cat.dragging) return;
     cat.dragging = false;
     cat.el.style.cursor = 'grab';
     cat.state = 'idle';
     cat.idleStreak = 0; // being picked up resets sleepiness
     cat.idleUntil = performance.now() + rand(300, 1200);
+    cat.animFrame = 0;
+    cat.animTimer = 0;
+    setFrame(cat.el, IDLE); // FIX: previously left showing the ALERT frame indefinitely
   }
 
   // decide what happens after a cat finishes wandering / catches its breath
@@ -120,6 +123,10 @@
     cats.push(cat);
     cat.el.addEventListener('pointerdown', e => startDrag(cat, e));
     cat.el.addEventListener('pointerup', () => endDrag(cat));
+    // FIX: if capture is revoked without a pointerup (alt-tab, context menu,
+    // browser gesture, etc.) the cat used to get stuck in 'dragged' forever.
+    cat.el.addEventListener('pointercancel', () => endDrag(cat));
+    cat.el.addEventListener('lostpointercapture', () => endDrag(cat));
     cat.el.addEventListener('pointermove', e => {
       if (!cat.dragging) return;
       cat.x = e.clientX;
@@ -133,84 +140,101 @@
     lastTime = now;
 
     for (const cat of cats) {
-      if (cat.dragging) { render(cat); continue; }
-
-      const dx = mouseX - cat.x, dy = mouseY - cat.y;
-      const distToMouse = Math.hypot(dx, dy);
-
-      // sleeping cats only care about the cursor getting close enough to wake them
-      if (cat.state === 'sleeping') {
-        if (distToMouse < WAKE_DISTANCE) {
-          cat.state = 'idle';
-          cat.idleStreak = 0;
-          cat.idleUntil = now + rand(300, 900);
-          setFrame(cat.el, ALERT);
-        } else {
-          cat.animTimer += dt;
-          if (cat.animTimer > 0.5) { cat.animTimer = 0; cat.animFrame = cat.animFrame === 0 ? 1 : 0; }
-          setFrame(cat.el, SLEEPING[cat.animFrame]);
-        }
-        render(cat);
-        continue;
+      // FIX: isolate each cat's update so one bad frame can't take down
+      // the whole shared animation loop (which would freeze every cat and
+      // make dragging look broken, since render() would stop being called).
+      try {
+        updateCat(cat, now, dt);
+      } catch (err) {
+        console.error('oneko: cat update failed', err);
       }
-
-      if (cat.state === 'tired') {
-        if (now >= cat.actionEnd) { cat.state = 'sleeping'; cat.animTimer = 0; cat.animFrame = 0; }
-        render(cat);
-        continue;
-      }
-
-      if (cat.state === 'scratch') {
-        cat.animTimer += dt;
-        if (cat.animTimer > 0.15) {
-          cat.animTimer = 0;
-          cat.animFrame = (cat.animFrame + 1) % SCRATCH_SELF.length;
-        }
-        setFrame(cat.el, SCRATCH_SELF[cat.animFrame]);
-        if (now >= cat.actionEnd) {
-          cat.state = 'idle';
-          cat.idleUntil = now + rand(IDLE_MIN, IDLE_MAX);
-        }
-        render(cat);
-        continue;
-      }
-
-      // chasing takes priority over everything and resets sleepiness
-      if (distToMouse < CHASE_DISTANCE && distToMouse > CATCH_DISTANCE) {
-        cat.state = 'chase';
-        cat.idleStreak = 0;
-      } else if (distToMouse <= CATCH_DISTANCE && cat.state === 'chase') {
-        startIdle(cat, now);
-      } else if (cat.state === 'chase' && distToMouse >= CHASE_DISTANCE) {
-        startIdle(cat, now);
-      }
-
-      let moving = false;
-      let dirX = 0, dirY = 0;
-
-      if (cat.state === 'chase') {
-        moving = true; dirX = dx; dirY = dy;
-        moveToward(cat, mouseX, mouseY, CHASE_SPEED, dt);
-      } else if (cat.state === 'idle') {
-        if (now >= cat.idleUntil) { cat.state = 'wander'; pickNewTarget(cat); }
-      } else if (cat.state === 'wander') {
-        moving = true;
-        dirX = cat.target.x - cat.x; dirY = cat.target.y - cat.y;
-        const arrived = moveToward(cat, cat.target.x, cat.target.y, WANDER_SPEED, dt);
-        if (arrived) startIdle(cat, now);
-      }
-
-      if (moving) {
-        cat.animTimer += dt;
-        if (cat.animTimer > 0.18) { cat.animTimer = 0; cat.animFrame = cat.animFrame === 0 ? 1 : 0; }
-        const dir = dirFromAngle(dirX, dirY);
-        setFrame(cat.el, DIRS[dir][cat.animFrame]);
-      }
-
-      render(cat);
     }
 
+    // FIX: always reschedule, even if a cat update threw above.
     requestAnimationFrame(loop);
+  }
+
+  function updateCat(cat, now, dt) {
+    if (cat.dragging) { render(cat); return; }
+
+    const dx = mouseX - cat.x, dy = mouseY - cat.y;
+    const distToMouse = Math.hypot(dx, dy);
+
+    // sleeping cats only care about the cursor getting close enough to wake them
+    if (cat.state === 'sleeping') {
+      if (distToMouse < WAKE_DISTANCE) {
+        cat.state = 'idle';
+        cat.idleStreak = 0;
+        cat.idleUntil = now + rand(300, 900);
+        setFrame(cat.el, ALERT);
+      } else {
+        cat.animTimer += dt;
+        if (cat.animTimer > 0.5) { cat.animTimer = 0; cat.animFrame = cat.animFrame === 0 ? 1 : 0; }
+        setFrame(cat.el, SLEEPING[cat.animFrame]);
+      }
+      render(cat);
+      return;
+    }
+
+    if (cat.state === 'tired') {
+      if (now >= cat.actionEnd) { cat.state = 'sleeping'; cat.animTimer = 0; cat.animFrame = 0; }
+      render(cat);
+      return;
+    }
+
+    if (cat.state === 'scratch') {
+      cat.animTimer += dt;
+      if (cat.animTimer > 0.15) {
+        cat.animTimer = 0;
+        cat.animFrame = (cat.animFrame + 1) % SCRATCH_SELF.length;
+      }
+      setFrame(cat.el, SCRATCH_SELF[cat.animFrame]);
+      if (now >= cat.actionEnd) {
+        cat.state = 'idle';
+        cat.idleUntil = now + rand(IDLE_MIN, IDLE_MAX);
+        setFrame(cat.el, IDLE); // FIX: previously left the last scratch frame showing
+      }
+      render(cat);
+      return;
+    }
+
+    // chasing takes priority over everything and resets sleepiness
+    if (distToMouse < CHASE_DISTANCE && distToMouse > CATCH_DISTANCE) {
+      cat.state = 'chase';
+      cat.idleStreak = 0;
+    } else if (distToMouse <= CATCH_DISTANCE && cat.state === 'chase') {
+      startIdle(cat, now);
+    } else if (cat.state === 'chase' && distToMouse >= CHASE_DISTANCE) {
+      startIdle(cat, now);
+    }
+
+    let moving = false;
+    let dirX = 0, dirY = 0;
+
+    if (cat.state === 'chase') {
+      moving = true; dirX = dx; dirY = dy;
+      moveToward(cat, mouseX, mouseY, CHASE_SPEED, dt);
+    } else if (cat.state === 'idle') {
+      if (now >= cat.idleUntil) { cat.state = 'wander'; pickNewTarget(cat); }
+    } else if (cat.state === 'wander') {
+      moving = true;
+      dirX = cat.target.x - cat.x; dirY = cat.target.y - cat.y;
+      const arrived = moveToward(cat, cat.target.x, cat.target.y, WANDER_SPEED, dt);
+      if (arrived) startIdle(cat, now);
+    }
+
+    // FIX: only paint a walking frame if the cat is *still* chasing/wandering
+    // after the logic above. Previously `moving` stayed true even when
+    // startIdle() just switched the cat to idle/tired/scratch this same tick,
+    // so the correct pose got immediately overwritten with a walking frame.
+    if (moving && (cat.state === 'chase' || cat.state === 'wander')) {
+      cat.animTimer += dt;
+      if (cat.animTimer > 0.18) { cat.animTimer = 0; cat.animFrame = cat.animFrame === 0 ? 1 : 0; }
+      const dir = dirFromAngle(dirX, dirY);
+      setFrame(cat.el, DIRS[dir][cat.animFrame]);
+    }
+
+    render(cat);
   }
 
   function moveToward(cat, tx, ty, speed, dt) {
