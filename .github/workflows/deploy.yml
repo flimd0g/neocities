@@ -13,4 +13,3 @@ jobs:
         with:
           api_token: ${{ secrets.NEOCITIES_API_KEY }}
           cleanup: false
-          dist_dir: .
