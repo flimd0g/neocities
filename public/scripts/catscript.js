@@ -1,17 +1,19 @@
 
 (function () {
   // ---- EASY CONFIG ----
-  const CAT_COUNT = 4;                 // <- change this to spawn more/fewer cats
-  const CAT_IMAGE = '../images/oneko.gif'; // <- path to oneko.gif on your site
+  const CAT_COUNT = 4;
+  const CAT_IMAGE = 'images/oneko.gif';
   const WANDER_SPEED = 55;
   const CHASE_SPEED = 150;
   const CHASE_DISTANCE = 160;
   const CATCH_DISTANCE = 28;
-  const IDLE_MIN = 800, IDLE_MAX = 3000;
+  const IDLE_MIN = 800, IDLE_MAX = 10000;
+  const SCRATCH_CHANCE = 0.3;      // chance an idle turns into a scratch instead of standing still
+  const IDLES_BEFORE_SLEEP = 3;    // consecutive idles (no chasing in between) before a cat gets sleepy
+  const WAKE_DISTANCE = 100;       // cursor closer than this wakes a sleeping cat
   // ----------------------
 
-  // oneko.gif is an 8x4 grid of 32x32 frames.
-  // Each entry is [col, row] (0-indexed) for that direction's two walk frames.
+  // oneko.gif is an 8x4 grid of 32x32 frames: [col, row], 0-indexed.
   const DIRS = {
     N:  [[1,2],[1,3]], NE: [[0,2],[0,3]],
     E:  [[3,0],[3,1]],  SE: [[5,1],[5,2]],
@@ -20,6 +22,9 @@
   };
   const IDLE = [3,3];
   const ALERT = [7,3];
+  const TIRED = [3,2];
+  const SLEEPING = [[2,0],[2,1]];
+  const SCRATCH_SELF = [[5,0],[6,0],[7,0]];
 
   const container = document.createElement('div');
   container.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:9999;';
@@ -34,7 +39,7 @@
   function rand(min, max) { return Math.random() * (max - min) + min; }
 
   function dirFromAngle(dx, dy) {
-    const angle = Math.atan2(dy, dx) * 180 / Math.PI; // -180..180
+    const angle = Math.atan2(dy, dx) * 180 / Math.PI;
     const dirs = ['E','SE','S','SW','W','NW','N','NE'];
     const idx = Math.round(((angle + 360) % 360) / 45) % 8;
     return dirs[idx];
@@ -59,13 +64,14 @@
       el,
       x: rand(40, window.innerWidth - 40),
       y: rand(80, window.innerHeight - 80),
-      facing: 1,
       state: 'idle',
       idleUntil: performance.now() + rand(IDLE_MIN, IDLE_MAX),
       target: { x: 0, y: 0 },
       dragging: false,
       animTimer: 0,
       animFrame: 0,
+      idleStreak: 0,      // consecutive idles without chasing, used to trigger sleep
+      actionEnd: 0,       // used for timed states like scratch/tired
     };
   }
 
@@ -86,7 +92,26 @@
     cat.dragging = false;
     cat.el.style.cursor = 'grab';
     cat.state = 'idle';
+    cat.idleStreak = 0; // being picked up resets sleepiness
     cat.idleUntil = performance.now() + rand(300, 1200);
+  }
+
+  // decide what happens after a cat finishes wandering / catches its breath
+  function startIdle(cat, now) {
+    cat.idleStreak++;
+    if (cat.idleStreak >= IDLES_BEFORE_SLEEP) {
+      cat.state = 'tired';
+      cat.actionEnd = now + 700;
+      setFrame(cat.el, TIRED);
+    } else if (Math.random() < SCRATCH_CHANCE) {
+      cat.state = 'scratch';
+      cat.actionEnd = now + 1200;
+      cat.animTimer = 0; cat.animFrame = 0;
+    } else {
+      cat.state = 'idle';
+      cat.idleUntil = now + rand(IDLE_MIN, IDLE_MAX);
+      setFrame(cat.el, IDLE);
+    }
   }
 
   const cats = [];
@@ -113,14 +138,51 @@
       const dx = mouseX - cat.x, dy = mouseY - cat.y;
       const distToMouse = Math.hypot(dx, dy);
 
+      // sleeping cats only care about the cursor getting close enough to wake them
+      if (cat.state === 'sleeping') {
+        if (distToMouse < WAKE_DISTANCE) {
+          cat.state = 'idle';
+          cat.idleStreak = 0;
+          cat.idleUntil = now + rand(300, 900);
+          setFrame(cat.el, ALERT);
+        } else {
+          cat.animTimer += dt;
+          if (cat.animTimer > 0.5) { cat.animTimer = 0; cat.animFrame = cat.animFrame === 0 ? 1 : 0; }
+          setFrame(cat.el, SLEEPING[cat.animFrame]);
+        }
+        render(cat);
+        continue;
+      }
+
+      if (cat.state === 'tired') {
+        if (now >= cat.actionEnd) { cat.state = 'sleeping'; cat.animTimer = 0; cat.animFrame = 0; }
+        render(cat);
+        continue;
+      }
+
+      if (cat.state === 'scratch') {
+        cat.animTimer += dt;
+        if (cat.animTimer > 0.15) {
+          cat.animTimer = 0;
+          cat.animFrame = (cat.animFrame + 1) % SCRATCH_SELF.length;
+        }
+        setFrame(cat.el, SCRATCH_SELF[cat.animFrame]);
+        if (now >= cat.actionEnd) {
+          cat.state = 'idle';
+          cat.idleUntil = now + rand(IDLE_MIN, IDLE_MAX);
+        }
+        render(cat);
+        continue;
+      }
+
+      // chasing takes priority over everything and resets sleepiness
       if (distToMouse < CHASE_DISTANCE && distToMouse > CATCH_DISTANCE) {
         cat.state = 'chase';
+        cat.idleStreak = 0;
       } else if (distToMouse <= CATCH_DISTANCE && cat.state === 'chase') {
-        cat.state = 'idle';
-        cat.idleUntil = now + rand(IDLE_MIN, IDLE_MAX);
+        startIdle(cat, now);
       } else if (cat.state === 'chase' && distToMouse >= CHASE_DISTANCE) {
-        cat.state = 'idle';
-        cat.idleUntil = now + rand(200, 800);
+        startIdle(cat, now);
       }
 
       let moving = false;
@@ -130,13 +192,12 @@
         moving = true; dirX = dx; dirY = dy;
         moveToward(cat, mouseX, mouseY, CHASE_SPEED, dt);
       } else if (cat.state === 'idle') {
-        setFrame(cat.el, IDLE);
         if (now >= cat.idleUntil) { cat.state = 'wander'; pickNewTarget(cat); }
       } else if (cat.state === 'wander') {
         moving = true;
         dirX = cat.target.x - cat.x; dirY = cat.target.y - cat.y;
         const arrived = moveToward(cat, cat.target.x, cat.target.y, WANDER_SPEED, dt);
-        if (arrived) { cat.state = 'idle'; cat.idleUntil = now + rand(IDLE_MIN, IDLE_MAX); }
+        if (arrived) startIdle(cat, now);
       }
 
       if (moving) {
@@ -145,9 +206,10 @@
         const dir = dirFromAngle(dirX, dirY);
         setFrame(cat.el, DIRS[dir][cat.animFrame]);
       }
+
+      render(cat);
     }
 
-    for (const cat of cats) render(cat);
     requestAnimationFrame(loop);
   }
 
