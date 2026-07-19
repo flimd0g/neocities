@@ -2,6 +2,9 @@
   // ---- EASY CONFIG ----
   const CAT_COUNT = 4;
   const CAT_IMAGE = 'images/oneko.gif';
+  // Per-cat sprite override: map a cat's index (0-based) to an alternate image.
+  // Any index not listed here uses CAT_IMAGE.
+  const CAT_IMAGE_OVERRIDES = { 0: 'images/oneko1.gif' };
   const WANDER_SPEED = 55;
   const CHASE_SPEED = 150;
   const CHASE_DISTANCE = 160;
@@ -25,14 +28,30 @@
   const SLEEPING = [[2,0],[2,1]];
   const SCRATCH_SELF = [[5,0],[6,0],[7,0]];
 
+  // FIX: container is now absolutely positioned over the *document*, not the
+  // viewport, so its contents scroll with the page instead of floating fixed
+  // on screen. Height is kept in sync with document.documentElement.scrollHeight.
   const container = document.createElement('div');
-  container.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:9999;';
+  container.style.cssText = 'position:absolute;top:0;left:0;width:100%;pointer-events:none;z-index:9999;';
   document.body.appendChild(container);
 
-  let mouseX = window.innerWidth / 2, mouseY = window.innerHeight / 2;
-  window.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
+  function syncContainerHeight() {
+    container.style.height = document.documentElement.scrollHeight + 'px';
+  }
+  syncContainerHeight();
+  window.addEventListener('resize', syncContainerHeight);
+  // Catch content growing/shrinking (images loading, dynamic content, etc.)
+  // without a resize event. Cheap to run occasionally.
+  new ResizeObserver(syncContainerHeight).observe(document.body);
+
+  // Mouse position is tracked in *viewport* coordinates (as the browser gives
+  // it to us). We convert to document coordinates on each update by adding
+  // the current scroll offset, so chasing stays correct even if the user
+  // scrolls without moving the mouse.
+  let mouseViewportX = window.innerWidth / 2, mouseViewportY = window.innerHeight / 2;
+  window.addEventListener('mousemove', e => { mouseViewportX = e.clientX; mouseViewportY = e.clientY; });
   window.addEventListener('touchmove', e => {
-    if (e.touches[0]) { mouseX = e.touches[0].clientX; mouseY = e.touches[0].clientY; }
+    if (e.touches[0]) { mouseViewportX = e.touches[0].clientX; mouseViewportY = e.touches[0].clientY; }
   });
 
   function rand(min, max) { return Math.random() * (max - min) + min; }
@@ -48,21 +67,25 @@
     el.style.backgroundPosition = `${-col * 32}px ${-row * 32}px`;
   }
 
-  function makeCat() {
+  function makeCat(index) {
     const el = document.createElement('div');
+    const image = CAT_IMAGE_OVERRIDES[index] || CAT_IMAGE;
     el.style.cssText = `
       position:absolute; left:0; top:0; width:32px; height:32px;
-      background-image:url('${CAT_IMAGE}'); background-repeat:no-repeat;
+      background-image:url('${image}'); background-repeat:no-repeat;
       image-rendering:pixelated; pointer-events:auto; cursor:grab;
       transform-origin:center;
     `;
     container.appendChild(el);
     setFrame(el, IDLE);
 
+    // Spawn positions are in *document* coordinates now, so we offset by the
+    // current scroll position to place cats within the visible viewport
+    // rather than always up near the top of the document.
     return {
       el,
-      x: rand(40, window.innerWidth - 40),
-      y: rand(80, window.innerHeight - 80),
+      x: rand(40, window.innerWidth - 40) + window.scrollX,
+      y: rand(80, window.innerHeight - 80) + window.scrollY,
       state: 'idle',
       idleUntil: performance.now() + rand(IDLE_MIN, IDLE_MAX),
       target: { x: 0, y: 0 },
@@ -75,8 +98,11 @@
   }
 
   function pickNewTarget(cat) {
-    cat.target.x = rand(40, window.innerWidth - 40);
-    cat.target.y = rand(80, window.innerHeight - 80);
+    // Wander targets are also document-relative, biased around the current
+    // viewport so cats tend to wander somewhere visible rather than the
+    // full (possibly huge) document height.
+    cat.target.x = rand(40, window.innerWidth - 40) + window.scrollX;
+    cat.target.y = rand(80, window.innerHeight - 80) + window.scrollY;
   }
 
   function startDrag(cat, e) {
@@ -119,7 +145,7 @@
 
   const cats = [];
   for (let i = 0; i < CAT_COUNT; i++) {
-    const cat = makeCat();
+    const cat = makeCat(i);
     cats.push(cat);
     cat.el.addEventListener('pointerdown', e => startDrag(cat, e));
     cat.el.addEventListener('pointerup', () => endDrag(cat));
@@ -129,8 +155,9 @@
     cat.el.addEventListener('lostpointercapture', () => endDrag(cat));
     cat.el.addEventListener('pointermove', e => {
       if (!cat.dragging) return;
-      cat.x = e.clientX;
-      cat.y = e.clientY;
+      // Convert the pointer's viewport coordinates to document coordinates.
+      cat.x = e.clientX + window.scrollX;
+      cat.y = e.clientY + window.scrollY;
     });
   }
 
@@ -139,12 +166,17 @@
     const dt = Math.min((now - lastTime) / 1000, 0.05);
     lastTime = now;
 
+    // Document-relative mouse position, recomputed every frame so scrolling
+    // alone (without mouse movement) still keeps chase behavior correct.
+    const mouseX = mouseViewportX + window.scrollX;
+    const mouseY = mouseViewportY + window.scrollY;
+
     for (const cat of cats) {
       // FIX: isolate each cat's update so one bad frame can't take down
       // the whole shared animation loop (which would freeze every cat and
       // make dragging look broken, since render() would stop being called).
       try {
-        updateCat(cat, now, dt);
+        updateCat(cat, now, dt, mouseX, mouseY);
       } catch (err) {
         console.error('oneko: cat update failed', err);
       }
@@ -154,7 +186,7 @@
     requestAnimationFrame(loop);
   }
 
-  function updateCat(cat, now, dt) {
+  function updateCat(cat, now, dt, mouseX, mouseY) {
     if (cat.dragging) { render(cat); return; }
 
     const dx = mouseX - cat.x, dy = mouseY - cat.y;
@@ -247,6 +279,9 @@
   }
 
   function render(cat) {
+    // cat.x/cat.y are document coordinates; the container itself is
+    // absolutely positioned over the document, so no extra scroll math is
+    // needed here — the browser handles scrolling the container's contents.
     cat.el.style.transform = `translate(${cat.x - 16}px, ${cat.y - 16}px)`;
   }
 
